@@ -1,25 +1,61 @@
-# Add to HostFirmwareComponents the NIC vendor/model Info
+# Align HostFirmwareComponents with SimpleUpdate API
 
-## Summary
+## Problem Statement
 
-NIC firmware updates require vendor/model identification to filter adapters,
-but there is no CR that exposes this information. Therefore users must manually
-query BMC Redfish APIs to identify which firmware applies to which NIC vendor.
+NIC firmware updates do not work as expected because the
+[HostFirmwareComponents (HFC)
+CRD](https://github.com/metal3-io/baremetal-operator/blob/main/apis/metal3.io/v1alpha1/hostfirmwarecomponents_types.go)
+from metal3.io implies that updates target specific NICs using a component
+identifier (adapter ID or serial number), but this does not reflect the actual
+behavior. The underlying [Redfish SimpleUpdate
+API](https://www.dmtf.org/sites/default/files/standards/documents/DSP2062_1.0.2.pdf)
+only accepts the firmware image URL and applies the update to all matching
+devices, ignoring the component identifier.
 
-This enhancement proposes extending the HostFirmwareComponents CRD [1]
-status.components[] with NIC metadata field: `vendor` (contains vendor/model combined).
-This makes HostFirmwareComponents self-contained for firmware management
-workflows without requiring correlation with other CRs.
+## Constraints
 
-## Goals
+- We can only use SimpleUpdate API, the URL to firmware file is only information passed to the BMC.
+- SimpleUpdate/Targets parameter exists, but is not implemented by Ironic and not be fully
+  supported by vendors. That means, all NICs of the same firmware a vendor will
+  be updated at once.
+- We cannot extract metadata from the firmware file in a standard/vendor
+  agnostic way, and we cannot validate firmware file contents. Only the BMC can
+  validate and determine applicability. Firmware version information is embedded
+  in the file and only known by the user providing the URL. The system
+  cannot determine if an update is needed without attempting it.
+- There is a unique firmware file per vendor and model.
 
-- Enable automated vendor-specific firmware updates using single CR
-- Identify changes needed in Metal3 CRD and Ironic firmware component API
-- No breaking changes to existing APIs
+## Background Info: Ironic and Simple Update
 
-## Firmware Update Background
+The
+[Redfish SimpleUpdate action](https://redfish.dmtf.org/schemas/v1/UpdateService.v1_17_0.json)
+updates software components via a software image file at a URI. The action is
+triggered via POST to `/redfish/v1/UpdateService/Actions/UpdateService.SimpleUpdate`
+with **Parameters:**
+- `ImageURI` (required): The URI of the software image to install
+- `Targets` (optional): Array of URIs indicating where to apply the update
 
-HostFirmwareComponents CRD [1] requires Redfish-specific component identifiers:
+From the [UpdateService schema](https://redfish.dmtf.org/schemas/v1/UpdateService.v1_17_0.json):
+"If this parameter is not present or contains no targets, the service shall
+apply the software image to all applicable targets."
+
+Ironic implementation does not use the `Targets` parameter. From the
+[Ironic firmware updates guide](https://docs.openstack.org/ironic/latest/admin/firmware-updates.html):
+"At the present time, targets for the firmware update cannot be specified. In
+testing, the BMC applied the update to all applicable targets on the node."
+
+## Use Case
+
+Update all **Intel NIC adapters** of node server-01 to firmware version **22.5.7**
+
+## Proposed HFC.spec
+
+Align the user-facing CR with the actual API behavior.
+
+Extend HostFirmwareComponents to use just `component: nic` which indicates that
+we do network interfaces (not bios) and provide a list of URLs of all the
+firmware we need.
+
 
 ```yaml
 apiVersion: metal3.io/v1alpha1
@@ -28,344 +64,165 @@ metadata:
   name: server-01
 spec:
   updates:
-  - component: nic:<ID>
-    url: http://firmware-repo/nic-firmware.bin
+    - component: nic
+      url:
+      - http://firmware-repo/E810_NVMUpdatePackage_v4_30.bin
+      - http://firmware-repo/fw-ConnectX4Lx-rel-14_32_1010.bin
+      - http://firmware-repo/fw-ConnectX6Dx-rel-22_38_1002.bin
 ```
 
-The `<ID>` is the identifier used to target the NIC for firmware updates.
+- There is no validation anywhere, URLs is given to BMC
+- BMC will process the file, and will apply if possible e.g. if valid firmware for Intel E810, all matching NICs will be upgraded.
+- The URL / firmware file name is given by the user
 
-Current HostFirmwareComponents CR status only provides component identifier and version,
-requiring users to correlate with other data sources to determine vendor.
+The HFC.spec will be populated by the `HardwareProfile.clcm.openshift.io` CR processed by `oran-o2ims` operator.
+
+### Update BMO to support URL list
+
+```
+PR: Change HostFirmwareComponents API to support flat NIC firmware list
+
+PR Description
+
+Change the HostFirmwareComponents CRD API to accept a flat list of NIC
+firmware URLs instead of requiring specific adapter targeting.
+```
+
+## Proposed HFC.Status
 
 ```yaml
-apiVersion: metal3.io/v1alpha1
-kind: HostFirmwareComponents
-metadata:
-  name: server-01
 status:
   components:
-  - component: nic:<ID>
-    currentVersion: "14.32.20.04"
-    # No other information
-```
-
-## Problem Statement
-
-Current NIC firmware update workflow requires privileged BMC access or CR correlation outside the
-normal firmware update flow, complicating automation and violating the design principle that only
-Metal3 should communicate with BMCs.
-
-### Use Case
-
-Update all **Intel NIC adapters** of node server-01 to firmware version **22.5.7**
-
-### Current Workflow
-
-Users must manually query BMC Redfish APIs to determine vendor:
-
-```
-Step 1: List all NetworkAdapters
-  └─> curl -k -u user:pass https://bmc-ip/redfish/v1/Chassis/<chassis-id>/NetworkAdapters/
-  └─> Data model: ["NIC.Slot1", "NIC.Slot2"]
-
-Step 2: For each NetworkAdapter, query to get vendor/model
-  └─> curl https://bmc-ip/redfish/v1/Chassis/<chassis-id>/NetworkAdapters/NIC.Slot1
-  └─> curl https://bmc-ip/redfish/v1/Chassis/<chassis-id>/NetworkAdapters/NIC.Slot2
-  └─> Extract Manufacturer and Model properties
-  └─> Data model:
-      [
-        {adapterId: "NIC.Slot1", vendor: "Intel Corporation", model: "Intel(R) 25GbE XXV710"},
-        {adapterId: "NIC.Slot2", vendor: "Mellanox", model: "ConnectX-5"}
-      ]
-
-Step 3: Filter for Intel adapters only
-  └─> Result: ["NIC.Slot1"]
-
-Step 4: Query HostFirmwareComponents to check current versions
-  └─> kubectl get hostfirmwarecomponents server-01 -o yaml
-  └─> Data model:
-      [
-        {adapterId: "NIC.Slot1", currentVersion: "14.32.20.04"},
-        {adapterId: "NIC.Slot2", currentVersion: "16.35.30.06"}
-      ]
-  └─> Compare NIC.Slot1 with target version (22.5.7)
-  └─> Version mismatch → update required
-
-Step 5: Create HostFirmwareComponents update for Intel adapters
-  └─> cat <<EOF | kubectl apply -f -
-      apiVersion: metal3.io/v1alpha1
-      kind: HostFirmwareComponents
-      metadata:
-        name: server-01
-      spec:
-        updates:
-        - component: nic:NIC.Slot1
-          url: http://firmware-repo/intel-nic-22.5.7.bin
-      EOF
-
-Step 6: Validate firmware updates completed
-  └─> kubectl get hostfirmwarecomponents server-01 -o yaml
-  └─> Verify status.components[].currentVersion matches 22.5.7 for NIC.Slot1
-```
-
-**Note**: Step 3 is unreliable on HPE hardware due to a known bug where the adapterId obtained from
-Redfish cannot be trusted for firmware updates.
-
-### Proposed Workflow
-
-Extend HostFirmwareComponents CRD [1] status.components[] to include NIC metadata.
-
-```yaml
-apiVersion: metal3.io/v1alpha1
-kind: HostFirmwareComponents
-metadata:
-  name: server-01
-status:
-  components:
-  - component: nic:<ID>
-    currentVersion: "14.32.20.04"
-    vendor: "Intel Corporation/Intel(R) 25GbE XXV710"  # NEW FIELD
-  - component: nic:<ID>
-    currentVersion: "16.35.30.06"
-    vendor: "Mellanox/ConnectX-5"         # NEW FIELD
-```
-
-Given that change in HostFirmwareComponents, the workflow becomes (same for all vendors):
-
-```
-Step 1: Query HostFirmwareComponents CR to check current versions and filter by vendor
-  └─> kubectl get hostfirmwarecomponents server-01 -o yaml
-  └─> Parse .status.components[] array
-  └─> Filter for Intel adapters by parsing vendor field (contains "Intel")
-  └─> Data model from .status.components[]:
-      [
-        {component: "nic:<ID>", vendor: "Intel Corporation/Intel(R) 25GbE XXV710",
-         currentVersion: "14.32.20.04"}
-      ]
-      # vendor format: "Manufacturer/Model" (primary) or "0xVVVV/0xDDDD" (fallback)
-  └─> Compare currentVersion with target version from user goal (22.5.7)
-  └─> Version mismatch (14.32.20.04 < 22.5.7) → update required
-
-Step 2: Create HostFirmwareComponents update for Intel adapters
-  └─> cat <<EOF | kubectl apply -f -
-      apiVersion: metal3.io/v1alpha1
-      kind: HostFirmwareComponents
-      metadata:
-        name: server-01
-      spec:
-        updates:
-        - component: nic:<ID>  # Copy component value from Step 1 status.components[].component
-          url: http://firmware-repo/intel-nic-22.5.7.bin
-      EOF
-
-Step 3: Validate firmware updates completed
-  └─> kubectl get hostfirmwarecomponents server-01 -o yaml
-  └─> Verify status.components[].currentVersion matches 22.5.7 for matching component
-```
-
-No manual BMC queries or CR correlation required. All information available in single CR.
-
-## Required Pull Requests
-
-### Ironic RFE
-
-Proposed RFE content:
-
-```
-Summary: [RFE] Add NIC vendor/model metadata to firmware component inventory
-
-Description:
-NIC firmware updates require vendor identification to filter adapters, but the
-firmware component API currently does not expose NIC metadata. Users must query
-multiple APIs or correlate data to determine which firmware applies to which vendor.
-
-Proposed API Change:
-
-API Endpoint: GET /v1/nodes/{uuid}/firmware (or equivalent)
-
-**Note**: This change requires a new Ironic API microversion.
-
-Add vendor field (combines manufacturer/model or PCI vendor/device) to NIC firmware component data:
-
-Expected Response Format:
-{
-  "firmware": {
-    "components": [
-      {
-        "component": "nic:NIC.Integrated.1",
-        "current_version": "14.32.20.04",
-        "vendor": "Intel Corporation/Intel(R) 25GbE XXV710"  // NEW FIELD*
-      }
-    ]
-  }
-}
-
-The single vendor field combines manufacturer and model strings, but that can be split 
-into separate vendor and model fields.
-
-Benefit: This enables automated vendor-specific firmware updates via Metal3
-HostFirmwareComponents without requiring BMC access or CR correlation workflows.
-
-Vendor field format depends on which approach succeeds:
-- Primary (Redfish): "Manufacturer/Model" (e.g., "Intel Corporation/Intel(R) 25GbE XXV710")
-- Fallback (IPA): "0xVVVV/0xDDDD" (e.g., "0x8086/0x1593")
-- Both failed: null
-Implementation Strategy:
-
-Primary Approach - Redfish NetworkAdapter Properties:
-- Query Redfish NetworkAdapter resource directly and extract vendor/model from Manufacturer/Model properties.
-- Both Dell iDRAC and HPE iLO implement these fields:
-  - Dell: "Manufacturer": "Intel Corporation", "Model": "Intel(R) 25GbE 2P XXV710 Adptr"
-  - HPE: "Manufacturer": "Intel Corp.", "Model": "Intel(R) Ethernet Network Adapter E810-XXVDA4T"
-  - Other vendors (Supermicro, Lenovo) may not populate these optional Redfish properties.
-
-Fallback Approach - IPA Inspection Data Correlation (if Redfish returns null):
-- Correlate Redfish NetworkAdapter with Ironic Python Agent (IPA) inspection data using MAC
-- Vendor/product always available (IPA collects from PCI during inspection)
-
-Important: The fallback complexity is significant and may not justify
-implementation. Even if technically feasible, the added complexity may
-outweigh the benefit given that both major vendors (Dell, HPE) populate
-Redfish Manufacturer/Model fields. Manufacturer/Model are optional in Redfish
-schema (may be null), if empty we have gracefull fallback to unknown
-
+  - component: nic      // generic type nic
+    id: xxxxx   // unique stable identifier like serial
+    model: 0x8086 0x1593 // vendor+product
+    currentVersion: 23.0.8
+    initialVersion: 23.0.8
 ```
 
 ### Ironic Implementation
 
-Repository: https://opendev.org/openstack/ironic [10]
-
-Implement RFE from PR #1 with primary approach and optional fallback.
+Repository: https://opendev.org/openstack/ironic
 
 ```
-Implementation sketch:
+Summary: [RFE] Add hardware model and serial number to firmware API for network adapters
 
-Primary Approach (Redfish):
-1. When returning firmware components, query Redfish for each NIC component:
-   GET /redfish/v1/Chassis/{id}/NetworkAdapters/{adapter_id}
+Description:
+The firmware API currently exposes firmware versions for network adapters but
+lacks hardware identification data (PCI vendor/product IDs, model names, and
+serial numbers). This makes it difficult to uniquely identify physical hardware,
+correlate firmware components with inventory data.
 
-2. Extract metadata from NetworkAdapter resource:
-   - Manufacturer
-   - Model
+Proposed API Change:
 
-3. If both Manufacturer and Model are available:
-   - Combine as: vendor = "Manufacturer/Model"
-   - Example: "Intel Corporation/Intel(R) 25GbE XXV710"
-   - Return enriched component
+API Endpoint: GET /v1/nodes/{uuid}/firmware
 
-4. If either Manufacturer or Model is null:
-   - Proceed to fallback approach (if implemented)
-   - If fallback not implemented: set vendor = null, log warning
+Add model and serial_number fields to firmware component data for NICs:
 
-Fallback Approach (IPA Correlation) - Optional:
-
-1. Query NetworkDeviceFunctions to get MACs:
-   GET /redfish/v1/Chassis/{id}/NetworkAdapters/{adapter_id}/NetworkDeviceFunctions/
-   Extract: NetworkDeviceFunction.Ethernet.MACAddress
-
-2. Query IPA inspection data:
-   GET /v1/nodes/{uuid}/inventory
-   Extract: interfaces[].mac_address, vendor, product
-
-3. Correlate by MAC address:
-   - Match NetworkDeviceFunction MACs with inventory.interfaces[].mac_address
-   - Extract vendor/product from matched interface
-   - Combine as: vendor = "0xVVVV/0xDDDD" (PCI vendor ID/device ID)
-   - Example: "0x8086/0x1593"
-
-4. Error handling:
-   - MAC not found in IPA inventory: set vendor = null
-   - Multiple MACs per adapter: use first matching interface
-   - No MACs in NetworkDeviceFunction: set vendor = null
-   - Log warnings for debugging
-
-Final Response Format:
+Expected Response Format:
 {
-  "component": "nic:<adapter_id>",
-  "current_version": "22.5.7",
-  "vendor": "Intel Corporation/Intel(R) 25GbE XXV710"  // Format depends on which approach succeeded
+"firmware": [
+  {
+    "component": "nic:NIC.Integrated.1",
+    "initial_version": "20.0.17",
+    "current_version": "20.0.17",
+    "last_version_flashed": "20.0.17",
+    "model": "0x8086 0x1593",          // NEW FIELD: PCI vendor/product IDs
+    "serial_number": "C8:1F:66:C7:A2:3C",  // NEW FIELD: Unique hardware ID
+    "created_at": "2025-06-26T01:33:13+00:00",
+    "updated_at": "2025-07-02T13:25:38+00:00"
+  }
+]
 }
+
+Field Formats:
+- model (PCI IDs preferred): "0xVENDOR 0xPRODUCT" (e.g., "0x8086 0x1593")
+- model (fallback): "Manufacturer Model" if PCI IDs unavailable
+- serial_number: Vendor-specific format (often MAC address of first port)
+```
+
+### Update gophercloud with new fields
+
+Repository: https://github.com/gophercloud/gophercloud
+
+BMO doesn't call Ironic API directly - it uses gophercloud as the client library.
+```
+PR Title: Add Model and SerialNumber fields to FirmwareComponent
+```
+
+### Update BMO to consume enriched response
+
+Repository: https://github.com/metal3-io/baremetal-operator
+
+```
+BMO PR Title
+
+Add Model and ID fields to HostFirmwareComponents status
+
+Description:
+Extend HostFirmwareComponents status to include hardware identification data
+for firmware components.
+
+Changes:
+- Add ID field (serial number) to FirmwareComponentStatus
+- Add Model field (PCI vendor+product IDs) to FirmwareComponentStatus
+- Change Component field from "nic:XXX" to generic type "nic"
+- Update GetFirmwareComponents to map new gophercloud fields
+- Requires gophercloud PR: "Add Model and SerialNumber fields to FirmwareComponent"
+
+Depends-On: gophercloud/gophercloud#XXXX
 ```
 
 
-### Metal3 Baremetal-Operator
+## NIC Information Available in BareMetalHost and HardwareData
 
-Repository: https://github.com/metal3-io/baremetal-operator [1]
-
-Add `Vendor` field (combines manufacturer/model or PCI vendor/device) to HostFirmwareComponents CRD
-status.components[] and populate from Ironic firmware component API.
-
-**Note**: Metal3 BareMetal Operator will need to be updated to support the new Ironic API microversion
-introduced by PR #2.
+Both CRs share the same `*HardwareDetails` struct containing NIC information:
 
 ```go
-type FirmwareComponentStatus struct {
-    Component      string   `json:"component"`
-    InitialVersion string   `json:"initialVersion,omitempty"`
-    CurrentVersion string   `json:"currentVersion,omitempty"`
-    LastVersionFlashed string `json:"lastVersionFlashed,omitempty"`
-    UpdatedAt      metav1.Time `json:"updatedAt,omitempty"`
-    Vendor         string   `json:"vendor,omitempty"`         // NEW FIELD (format: "Manufacturer/Model" or "0xVVVV/0xDDDD")
+// https://github.com/metal3-io/baremetal-operator/blob/a4765e4d/apis/metal3.io/v1alpha1/baremetalhost_types.go#L687
+// BareMetalHostStatus contains hardware details
+type BareMetalHostStatus struct {
+  HardwareDetails *HardwareDetails `json:"hardware,omitempty"`
+}
+
+// https://github.com/metal3-io/baremetal-operator/blob/a4765e4d/apis/metal3.io/v1alpha1/hardwaredata_types.go#L226
+// HardwareDataSpec contains hardware details
+type HardwareDataSpec struct {
+  HardwareDetails *HardwareDetails `json:"hardware,omitempty"`
+}
+
+// HardwareDetails contains NIC array
+type HardwareDetails struct {
+  NIC []NIC `json:"nics,omitempty"`
+  // ... other hardware fields
+}
+
+// https://github.com/metal3-io/baremetal-operator/blob/a4765e4d/apis/metal3.io/v1alpha1/hardwaredata_types.go#L144-L177
+// NIC struct with vendor information
+type NIC struct {
+  // ... other NIC fields
+  Model     string `json:"model,omitempty"`  // Format: "0x8086 0x1593" (vendor+product IDs)
+  // ... other NIC fields
 }
 ```
 
-No breaking change (optional field).
+During hardware inspection, the controller retrieves inventory data from Ironic
+and converts it using `hardwaredetails.GetHardwareDetails()`. The controller
+first updates `BareMetalHost.Status.HardwareDetails`, then creates/updates the
+HardwareData CR with identical data.
 
+Relevant Information: 
 ```
-Implementation approach:
-1. Query Ironic firmware component API
-2. Extract vendor field from Ironic response
-3. Map to HostFirmwareComponents.Status.Components[]:
-   component → Component
-   current_version → CurrentVersion
-   vendor → Vendor (NEW, contains combined manufacturer/model or PCI IDs)
-4. Update HostFirmwareComponents CR status
+  Model     string `json:"model,omitempty"`  // Format: "0x8086 0x1593" (vendor+product IDs)
 ```
-
-### BareMetalHost NIC.Model mismatch to HostFirmwareComponents vendor
-
-The BareMetalHost NIC struct uses the `Model` field with space-separated PCI vendor/device IDs format
-(e.g., `"0x8086 0x1572"`), as defined in [baremetalhost_types.go#L713](https://github.com/metal3-io/baremetal-operator/blob/a958720595d6ca33fffb2f925ae6669e8635b1cc/apis/metal3.io/v1alpha1/baremetalhost_types.go#L713).
-
-**The primary approach (Redfish Manufacturer/Model strings) has a format mismatch with BareMetalHost.**
-The primary approach produces human-readable strings like `"Intel Corporation/Intel(R) 25GbE XXV710"`,
-while BMH uses PCI IDs like `"0x8086 0x1572"`. This inconsistency across Metal3 APIs means users would
-see different vendor formats depending on which CR they query.
-
-The fallback approach (IPA correlation with PCI IDs) matches the BMH format, providing consistency
-across Metal3 APIs. Nevertheless that PCI vendor/device IDs are static, so maintaining an internal
-mapping from PCI IDs to manufacturer/model names could be an option. We could either do only the fallback
-or extend BareMetalHost NIC Struct
 
 ### Sushy-Tools for Libvirt
 
 Repository: https://opendev.org/openstack/sushy-tools [21]
 
-Enable missing Redfish NetworkAdapter emulation to support the above use case for testing without
-physical hardware.
 
 ## References
 
-- Metal3 Ironic container: https://github.com/metal3-io/ironic-image
-- Metal3 API docs: https://github.com/metal3-io/baremetal-operator/blob/main/docs/api.md
-- Metal3 firmware updates guide: https://book.metal3.io/bmo/firmware_updates
-- Ironic firmware updates guide: https://docs.openstack.org/ironic/latest/admin/firmware-updates.html
-- Ironic Redfish driver: https://docs.openstack.org/ironic/2025.1/admin/drivers/redfish.html
-- Ironic NIC firmware updates spec: https://specs.openstack.org/openstack/ironic-specs/specs/not-implemented/nic-firmware-updates.html
-- Ironic NIC firmware update implementation: https://opendev.org/openstack/ironic/commit/0624d19876abeb9e1e82104ab6993fb9cc860bd6
-- Ironic NetworkAdapter identifiers implementation: https://review.opendev.org/c/openstack/ironic/+/972421 (not merged)
-- Ironic upstream: https://github.com/openstack/ironic
-- Ironic inspection docs: https://docs.openstack.org/ironic/2025.1/admin/inspection/index.html
-- Redfish inspection spec: https://specs.openstack.org/openstack/ironic-specs/specs/12.0/redfish-inspection.html
-- DSP2062 Firmware Update White Paper: https://www.dmtf.org/sites/default/files/standards/documents/DSP2062_1.0.2.pdf
-- DSP2046 Resource and Schema Guide: https://www.dmtf.org/sites/default/files/standards/documents/DSP2046_2025.1.pdf
-- Redfish Schema: https://redfish.dmtf.org/schemas/DSP0266_1.15.1.html
-
-1. Metal3 baremetal-operator: https://github.com/metal3-io/baremetal-operator
-10. Ironic opendev: https://opendev.org/openstack/ironic
-13. Ironic API version history: https://docs.openstack.org/ironic/latest/contributor/webapi-version-history.html
-17. Dell iDRAC Redfish scripting: https://github.com/dell/iDRAC-Redfish-Scripting
-18. Dell iDRAC API guide: https://www.dell.com/support/manuals/en-us/idrac9-lifecycle-controller-v4.x-series/idrac9_4.00.00.00_redfishapiguide_pub
-19. HPE iLO Redfish services: https://servermanagementportal.ext.hpe.com/docs/redfishservices/ilos/ilo6
-20. HPE firmware updates: https://developer.hpe.com/blog/hpe-firmware-updates-part-3-the-redfish-update-service/
-21. Sushy-tools: https://docs.openstack.org/sushy-tools/latest/
+- Metal3 baremetal-operator: https://github.com/metal3-io/baremetal-operator
+- Ironic: https://opendev.org/openstack/ironic
+- gophercloud: https://github.com/gophercloud/gophercloud
